@@ -28,3 +28,35 @@ pip install -r requirements.txt
     or for videos:
 
     python main.py --imgpath Videos
+
+
+#### How to make database for training
+
+1. Copy photos and videos from which you are going to extract faces to "database/source"
+2. Run following command to run the program:
+
+    python cropFace.py
+
+3. Then cropped and aligned faces will be generated in "database/cropped"
+4. Manually copy cropped faces into right directory of "database/face-datasets"
+    Our training datasets were built as following structure:
+    ```
+    /face-datasets
+        /person1
+        + face_01.jpg
+        + face_02.jpg
+        + ...
+        /person2
+        + face_01.jpg
+        + face_02.jpg
+        + ...
+        / ...
+
+    ```
+    In each `/person_x` folder, put your face images corresponding to _person_name_
+
+#### How to train classificaton model
+
+    Run following command to train classification model
+
+    python recogTrain.py

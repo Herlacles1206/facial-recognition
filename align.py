@@ -159,7 +159,7 @@ def alignFace(image, kp):
     
     return rotated_image
 
-def maskFace(image, face, tl, br, landmarks, caption, show_landmarks = False, show_caption = True, mask_face = True):
+def maskFace(image, face, tl, br, caption, landmarks = [], show_landmarks = False, show_caption = True, mask_face = True):
     # draw a rectangle along the bounding box of face
     # cv2.rectangle(image, tl, br, (0, 0, 255), 2)
     (t, l) = tl

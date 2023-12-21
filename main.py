@@ -16,14 +16,10 @@ from recogTrain import *
 from utils import *
 from sklearn.preprocessing import LabelEncoder
 from softmax_nn import SoftMax
-from tracker.kalman_filter import KalmanFilter 
-from tracker.feature_extractor import Extractor
-from tracker.detection import Detection
-from tracker.track import Track
-from tracker.iou_matching import *
 import torch.nn.functional as F
 from moviepy.editor import *
 
+from net.tracker import SiamRPNTracker
 
 # Setup some useful arguments
 cosine_threshold = 0.8
@@ -39,10 +35,10 @@ recog_model = None
 device_recog = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 min_iou_distance = 0.25
-target_names = ['Adrian Robinson']  
+score_thres = 0.4
+target_names = ['Person 7', 'Adrian Robinson']  
 trackers = {}
-extractor = Extractor()
-kf = KalmanFilter()
+
 
 # variable to count frame in case of face cropping
 face_save_flag = 0 
@@ -119,57 +115,69 @@ def detectAndRecognition(srcImg, _imgsz, _conf, _iou, _augment, _device, isVid =
 
             if not isVid:
                 if name in trackers.keys():
-                    maskFace(srcimg_copy, face, (x1, y1), (x2, y2), keypoint.xy[0], caption)
+                    maskFace(srcimg_copy, face, (x1, y1), (x2, y2), caption)
                 continue
             # Tracking if video
-            
-            bbox_xywh = [[(x1+x2)/2, (y1+y2)/2, x2-x1, y2-y1]]
-            bbox_xywh = np.array(bbox_xywh)
-            # print('bbox_xywh: {}'.format(bbox_xywh))
-
-            features = extractor._get_features(bbox_xywh, srcImg)
-            bbox_tlwh = xywh_to_tlwh(bbox_xywh)
-            detection = Detection(bbox_tlwh[0], conf, features[0], i) 
-            detections.append(detection)
+            bbox_tlwh = [x1, y1, x2-x1, y2-y1]
+            bbox_tlwh = np.array(bbox_tlwh)
+            detections.append(bbox_tlwh)
             # Initialize tracker if it is recognized
             if name in trackers.keys():
-            
-                mean, covariance = kf.initiate(detection.to_xyah())
-                trackers[name] = Track(mean, covariance, target_names.index(name), 0, 0, detection.oid, detection.feature)
+                init_box = [x1, y1, x2-x1, y2-y1]
+                t_tracker = trackers[name]['model']
+                t_tracker.init(srcImg, init_box)
+                trackers[name]['model'] = t_tracker
+                trackers[name]['initialized'] = True
+                # print('model for {} is initialized'.format(name))
                 det_match_flag[i] = 1
                 tra_match_flag[target_names.index(name)] = 1
 
-                maskFace(srcimg_copy, face, (x1, y1), (x2, y2), keypoint.xy[0], caption)
+                maskFace(srcimg_copy, face, (x1, y1), (x2, y2), caption)
 
         # Updating tracker
         if not isVid:
             return srcimg_copy
         for i, name in enumerate(target_names):
-            if tra_match_flag[i] == 1 or trackers[name] == None:
+            if tra_match_flag[i] == 1:
                 continue
-            tracker = trackers[name]
-            tracker.predict(kf)
+            tracker = trackers[name]['model']
+            if trackers[name]['initialized'] == False:
+                continue
+            bbox, score = tracker.update(srcImg)
+            if score < score_thres:
+                trackers[name]['initialized'] = False
+            bbox = np.array(bbox)
+            # print('bbox: {}, score: {}'.format(bbox, score))
+            tlwh_box = xywh_to_tlwh(bbox)
             detection_indices = []
             for j, det in enumerate(detections):
                 if det_match_flag[j] == 0: detection_indices.append(j)
 
             if len(detection_indices) == 0: 
-                tracker = None
+                if trackers[name]['initialized']:
+                    x1, y1, x2, y2 = tlwh_to_xyxy(tlwh_box, img_w, img_h)
+                    face = srcImg[y1:y2, x1:x2]
+                    maskFace(srcimg_copy, face, (x1, y1), (x2, y2), name)
                 continue
-            cost_matrix = iou_cost(tracker, detections, detection_indices)
+            # print('detection_indices: {}'.format(detection_indices))
+            cost_matrix = iou_cost(tlwh_box, detections, detection_indices)
             # print('cost matrix {}'.format(cost_matrix))
             min_index = np.argmin(cost_matrix)
             if cost_matrix[min_index] > min_iou_distance:
-                tracker = None
+                # x1, y1, x2, y2 = tlwh_to_xyxy(tlwh_box, img_w, img_h)
+                # face = srcImg[y1:y2, x1:x2]
+                # maskFace(srcimg_copy, face, (x1, y1), (x2, y2), name)
+                trackers[name]['initialized'] = False
+                continue
             else:
-                tracker.update(kf, detections[detection_indices[min_index]])
+                tracker.init(srcImg, detections[detection_indices[min_index]])
                 tra_match_flag[i] = 1
                 det_match_flag[detection_indices[min_index]] = 1
-                box = tracker.to_tlwh()
-                # h, w, _ = srcimg_copy.shape
-                # x1, y1, x2, y2 = tlwh_to_xyxy(box, w, h)
-                trackers[name] = tracker
-                maskFace(srcimg_copy, face, (x1, y1), (x2, y2), keypoint.xy[0], name)
+                box = detections[detection_indices[min_index]]
+                x1, y1, x2, y2 = tlwh_to_xyxy(box, img_w, img_h)
+                face = srcImg[y1:y2, x1:x2]
+                trackers[name]['model'] = tracker
+                maskFace(srcimg_copy, face, (x1, y1), (x2, y2), name)
 
        
         return srcimg_copy
@@ -198,14 +206,19 @@ def recognition(face_image):
     return score, name
 
 def recognitionWithCosineSimilarity(face_image):
+    st_time = time.time()
     # Get feature from face
     query_emb = (get_feature(face_image, training=False))
-    
+    end_time = time.time()
+
+    # print('embedding time is {} ms'.format((end_time - st_time)* 1000))
     # Read features
     images_names, images_embs = read_features()   
 
     le = LabelEncoder()
     labels = le.fit_transform(images_names)
+
+    st_time = time.time()
 
     # Pytorch
     # print('device: {}'.format(device_recog))
@@ -239,6 +252,10 @@ def recognitionWithCosineSimilarity(face_image):
         text = "{}".format(name)
         # print("Recognized: {} <{:.2f}>".format(name, proba*100))
     
+    end_time = time.time()
+
+    # print('classification time is {} ms'.format((end_time - st_time)* 1000))
+
     return cos_similarity, name
 
 
@@ -268,11 +285,12 @@ if __name__ == '__main__':
     recog_model = SoftMax(input_shape=(checkpoint['input_shape'], ), num_classes=checkpoint['num_classes']).to(device_recog)
     recog_model.load_state_dict(checkpoint['state_dict'])
 
-    print(recog_model)
+    # print(recog_model)
     
     # Assign trackers for each name
+    model_path = 'weights/SiamRPNVOT.model'
     for name in target_names:
-        trackers[name] = None
+        trackers[name] = dict(model=SiamRPNTracker(model_path), initialized = False)
 
     # Check if the directory exists
     if not os.path.exists(opt.output):
@@ -315,12 +333,17 @@ if __name__ == '__main__':
             cv2.imwrite(dstName, dstImg)
             
         elif is_vid:
+            # Initialize trackers for new video
+            for name in target_names:
+                trackers[name]['initialized'] = False
+
             # Loading video dsa gfg intro video
             clip = VideoFileClip(srcName)
 
             # Getting audio from the clip
             audioclip = clip.audio
 
+            # clip.close()
             # print('input: ', srcName)
             cap = cv2.VideoCapture(srcName)
 
@@ -339,8 +362,9 @@ if __name__ == '__main__':
 
             # frame_width = int(cap.get(3))
             # frame_height = int(cap.get(4))
-
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
             video = cv2.VideoWriter(dstName, fourcc, fps, (width, height))
+            print('{} is created'.format(dstName))
             # Read until video is completed
             while(cap.isOpened()):
                 # Capture frame-by-frame
@@ -375,6 +399,10 @@ if __name__ == '__main__':
 
             # Saving the combined video with audio
             clip_with_audio.write_videofile(tempDstName, codec="libx264", fps=fps)
+
+            clip.close()
+            audioclip.close()
+
             # Delete the original video file
             os.remove(dstName)
             
